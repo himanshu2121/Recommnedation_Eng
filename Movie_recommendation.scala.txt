@@ -1,0 +1,104 @@
+import org.apache.spark.SparkContext 
+import org.apache.spark.mllib.recommendation.{ALS,Rating,MatrixFactorizationModel }
+import scala.io.Source
+import java.util.Random
+import org.apache.spark.SparkContext._
+
+object Movie_recommendation { 
+	def main(args: Array[String]) { 
+		if (args.length < 1) { 
+			System.err.println("Usage: Movie_recommendation <file>") System.exit(1) } 
+		val sc = new SparkContext() 
+		val movies = sc.textFile("file:///home/cloudera/Documents/MLib_datasets/movies.csv").map(line =>line.split(",")).map(word=> (word(0),word(1))).collect.toMap
+		val ratings = sc.textFile("file:///home/cloudera/Documents/MLib_datasets/ratings.csv").map(line =>line.split(",")).map(word=> (word(0),word(1),word(2)))
+		val mostRatedMovieIds = ratings.map(_.2_.product).countByValue.toSeq.sortBy(-_._2).take(50).map(_._1)
+		val random = new Random(0)
+		val selectedMovies = mostRatedMovieIds.filter(x => random.nextDouble() < 0.2).map(x => (x,movies(x))).toSeq
+		// Then for each of the selected movies , we will ask to give arating (1-5) or ) if you 've not seen the movie . This method elictateRatings returns your ratings
+		def elicitateRatings(movies:Seq[(Int,String)]) = {
+			prompt = "Please rate the follwing movie (1-5) or 0 if not seen:"
+			println("Please rate the follwing movie (1-5) or 0 if not seen:"
+			val ratings = movies.flatMap{ x => var rating:Option[Rating]=None
+				var valid = false
+			    while ( !valid) {
+			    	print(x._2 + ":  ")
+				try {
+					val r = Console.readInt
+					if ( r<0 || e >5) {
+						println(""Please rate the follwing movie (1-5) or 0 if not seen:")
+					}
+					else {
+						valid = true
+						if (r>0){
+							rating = Some(Rating(0,x._1,r))
+						}
+					}
+				} catch {
+				   case e:Exception => println(""Please rate the follwing movie (1-5) or 0 if not seen:")
+				}
+			}
+			rating match {
+				case Some(r) =>Iterator(r)
+				case None => Iterator.empty
+			}
+			if (ratings.isEmpty) {
+				error("No rating provided ")
+			} 
+			else {
+				ratings
+			}
+		}
+		val myRatings = elicitateRatings(selectedMovies)
+		val myRatingsRDD = sc.parallelize(myRatings)
+
+		// splitting  training data
+		val numPartitions =20
+		val training = ratings.filter(x =>x._1 <6).values.union(myRatingsRDD).repartition(numPartitions).persist
+		val validation = ratings.filter(x => x._1 >=6 && x._1 < 8).values.repartition(numPartitions).persist
+		val test = ratings.filter(x => x._1 >=8).values.persist
+		val numTraining = training.count
+		val numValidation = validation.count
+		val numTest = test.count
+
+		println("Training:  " + numTraining +", validation: " + numValidation + ", test :"+numTest)
+
+		// Compute RMSE 
+		def computeRmse(model: MatrixFactorizationModel,data: RDD[Rating], n:Long) ={
+			val predictions: RDD[Rating] = model.predict(data.map(x => (x.user ,x.product)))
+			val predictonsAndRatings = predictions.map(x =>((x.user , x.product),x.rating)).join(data.map(x=>((x.user,x.product),x.rating))).values
+			math.sqrt(predictionsAndRatings.map(x => (x._1 - x._2) * (x._1 - x._2)).reduce(_+_) / n)
+			}
+			val ranks = List(8,12)
+			val lambdas = List(0.1,10.0)
+			val numIters = List(10,20)
+			var bestModel: Option[MatrixFactorizationModel ] = None
+			var bestValidationRmse = Double.MaxValue
+			var bestRank = 0
+			var bestLambda = -1.0
+			var bestNumIter = -1
+ 			for ( rank <- ranks ; lambda <- lambdas ; numIter <- numIters) {
+				val model = ALS.train(training,rank,numIter,lambda)
+				val validationRmse = computeRmse(model , validation ,numValidation )
+				println( "RMSE (validation) = "+ validationRmse + "for the model trained with  rank = " + rank + ", lambda = ", and numIter = "numIter + ".")
+				if (validationRmse < bestValidationRmse) {
+					bestModel = Some(model)
+					bestValidationRmse = validationRmse
+					bestRank = rank
+					bestLambda = lambda
+   					bestNumIter = numIter
+				}
+			}
+			val testRmse = computeRmse(bestModel.get , test , numTest )
+			println( "best model trained with Rank" + bestRank + " and lambda = " + bestLambda + " RMSE is " + testRmse )
+		// Recommending movies for you	
+		val myRatedMovieIds = myRatings.map(_.product).toSet
+			val candidates = sc.parallelize(movies.keys.filter(!myRatedMovieIds.contains(_)).toSeq)
+			val recommendations =  bestModel.get.predict( candidates.map((0,_))).collect.sortBy(-_.rating).take(50)
+			val i = 1
+			println("Movie recommend for you")
+			recommendations.foreach { r =>
+				println("%2d",format(i)+":"+ movies(r.product))
+				i = i+1
+			}			
+
+	
